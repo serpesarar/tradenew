@@ -1,5 +1,6 @@
 import logging
 from pathlib import Path
+from typing import Iterable, Optional
 
 import numpy as np
 import pandas as pd
@@ -11,21 +12,18 @@ EVENT_PREDS_PATH = "./staging/nasdaq_event_outcomes_with_preds_v2.parquet"
 OUTPUT_PARQUET = "./staging/nasdaq_fake_live_short_signals_with_model_v1.parquet"
 OUTPUT_CSV = "./staging/nasdaq_fake_live_short_signals_with_model_v1.csv"
 
-# =============================================================================
-# SHORT FİLTRE PARAMETRELERİ - Teknik analiz + model tahminleri
-# =============================================================================
-HIGH_CONF_THRESHOLD = 0.57       # max_prob minimum eşik
-P_DOWN_MIN = 0.38                # p_down minimum değer
-P_DOWN_MARGIN = 0.03             # p_down, p_up'tan en az bu kadar yüksek olmalı
-P_CHOP_MAX = 0.60                # p_chop bu değerin üzerindeyse PASS (çok belirsiz)
-# =============================================================================
-# SHORT FİLTRE PARAMETRELERİ - Sadece temel filtreler (SHORT iyi çalışıyordu)
-# =============================================================================
-HIGH_CONF_THRESHOLD = 0.57       # max_prob minimum eşik
-P_DOWN_MIN = 0.38                # p_down minimum değer
-P_DOWN_MARGIN = 0.03             # p_down, p_up'tan en az bu kadar yüksek olmalı
-P_CHOP_MAX = 0.60                # p_chop bu değerin üzerindeyse PASS (çok belirsiz)
-REQUIRE_DOWN_TREND = True        # True ise sadece DOWN_TREND regime'de SHORT al
+# -----------------------------------------------------------------------------
+# Tunable structural filters (mirrors LONG side, inverted for shorts)
+# -----------------------------------------------------------------------------
+USE_PATTERN_WAVE_FILTER = True
+ALLOWED_SHORT_WAVES: set[int] = {1, 2, 3}
+
+USE_CHANNEL_FILTER = True
+
+USE_SR_FILTER = True
+MIN_SR_STRENGTH = 2.0  # sr_resistance_strength_at_entry minimum
+MAX_SR_DISTANCE_PIPS = 50.0
+MIN_SR_REACTIONS = 4
 
 # -----------------------------------------------------------------------------
 # Logging
@@ -37,34 +35,84 @@ logging.basicConfig(
 logger = logging.getLogger("fake_live_short_signal_pipeline")
 
 
-def normalize_future_dir(value) -> str | float:
-    """
-    future_dir numeric değerini string label'a çevirir.
-    Dataset'te 0/1/2 bazen CHOP/ DOWN / UP olarak geliyor.
-    """
-    if isinstance(value, str):
-        val = value.strip().upper()
-        if val in {"UP", "DOWN", "CHOP"}:
-            return val
-    if pd.isna(value):
-        return np.nan
-
-    try:
-        val = int(value)
-    except (TypeError, ValueError):
-        return np.nan
-
-    mapping = {
-        2: "UP",
-        1: "DOWN",   # Dataset'te 1 genelde DOWN encode edilmiş
-        0: "CHOP",
-        -1: "DOWN",
-    }
-    return mapping.get(val, np.nan)
+# -----------------------------------------------------------------------------
+# Column documentation (playbook context)
+# -----------------------------------------------------------------------------
+# Support/Resistance columns (at entry):
+#   - sr_support_price_at_entry, sr_support_strength_at_entry, sr_support_distance_pips_at_entry
+#   - sr_resistance_price_at_entry, sr_resistance_strength_at_entry, sr_resistance_distance_pips_at_entry
+#   - sr_near_support_at_entry, sr_near_resistance_at_entry
+#   - nearest_sr_type, nearest_sr_dist_pips
+#   - optional reaction-count columns (e.g., sr_resistance_reaction_count_at_entry)
+# Channel/regime columns (M30):
+#   - chan_is_up_M30_at_entry, chan_is_down_M30_at_entry, is_range_M30_at_entry
+#   - near_lower_chan_M30_at_entry, near_upper_chan_M30_at_entry
+# Wave/leg columns:
+#   - signal_wave_at_entry, wave_strength_pips_at_entry, wave_duration_bars_at_entry
+#   - up_move_pips_at_entry, down_move_pips_at_entry, up_duration_bars_at_entry, down_duration_bars_at_entry
 
 
+# -----------------------------------------------------------------------------
+# Helpers shared with LONG side
+# -----------------------------------------------------------------------------
+def _ensure_future_dir_label(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.copy()
+
+    if "future_dir_label" in df.columns:
+        return df
+
+    if "future_dir" not in df.columns:
+        df["future_dir_label"] = np.nan
+        return df
+
+    col = df["future_dir"]
+
+    if np.issubdtype(col.dtype, np.number):
+        mapping = {0: "CHOP", 1: "DOWN", 2: "UP"}
+        df["future_dir_label"] = col.map(mapping).fillna("UNKNOWN")
+    else:
+        df["future_dir_label"] = col.astype(str).str.upper()
+
+    return df
+
+
+def _ensure_tp_sl_result_label(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.copy()
+
+    if "tp_sl_result_label" in df.columns:
+        return df
+
+    if "tp_sl_result" not in df.columns:
+        df["tp_sl_result_label"] = np.nan
+        return df
+
+    raw = df["tp_sl_result"]
+    num = pd.to_numeric(raw, errors="coerce")
+
+    if num.notna().any():
+        def _map_num(v):
+            if pd.isna(v):
+                return np.nan
+            if v > 0:
+                return "TP"
+            if v < 0:
+                return "SL"
+            return "BE"
+
+        mapped_from_num = num.map(_map_num)
+        raw_str = raw.astype("string").str.upper()
+        res = mapped_from_num.where(num.notna(), raw_str)
+    else:
+        res = raw.astype("string").str.upper().fillna("UNKNOWN")
+
+    df["tp_sl_result_label"] = res
+    return df
+
+
+# -----------------------------------------------------------------------------
+# Load
+# -----------------------------------------------------------------------------
 def load_data() -> tuple[pd.DataFrame, pd.DataFrame]:
-    """Short playbook sinyallerini ve model tahminlerini yükler."""
     logger.info("=" * 79)
     logger.info("🚀 NASDAQ FAKE-LIVE SHORT SIGNAL PIPELINE v1 BAŞLIYOR")
     logger.info("=" * 79)
@@ -80,37 +128,46 @@ def load_data() -> tuple[pd.DataFrame, pd.DataFrame]:
     return sig_df, preds_df
 
 
+# -----------------------------------------------------------------------------
+# Merge
+# -----------------------------------------------------------------------------
 def merge_signals_with_preds(sig_df: pd.DataFrame, preds_df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Short playbook sinyallerini, event outcome tahminleriyle merge eder.
+    """Short playbook sinyallerini, event outcome tahminleriyle merge eder.
+
     Join key: [timestamp, event_type, entry_price]
     """
+
     logger.info("🔗 Short playbook sinyalleri ile model tahminleri merge ediliyor...")
 
-    # Sadece gerekli kolonları al
-    keep_cols = [
+    required_cols = [
         "timestamp",
         "event_type",
         "entry_price",
         "p_chop",
         "p_up",
         "p_down",
-        "pred_class",
         "pred_label",
         "max_prob",
+    ]
+    optional_cols = [
+        "pred_class",
         "recommendation",
-        "tp_sl_result",
         "future_dir",
+        "future_dir_label",
+        "tp_sl_result",
+        "tp_sl_result_label",
         "max_up_move_pips",
         "max_down_move_pips",
     ]
-    missing = [c for c in keep_cols if c not in preds_df.columns]
+
+    missing = [c for c in required_cols if c not in preds_df.columns]
     if missing:
         raise ValueError(f"❌ Tahmin datasetinde eksik kolonlar var: {missing}")
 
+    available_optional = [c for c in optional_cols if c in preds_df.columns]
+    keep_cols = required_cols + available_optional
     preds_small = preds_df[keep_cols].copy()
 
-    # Tip uyumu (özellikle timestamp ve entry_price)
     sig_df = sig_df.copy()
     preds_small = preds_small.copy()
 
@@ -125,31 +182,10 @@ def merge_signals_with_preds(sig_df: pd.DataFrame, preds_df: pd.DataFrame) -> pd
         on=["timestamp", "event_type", "entry_price"],
         how="left",
         suffixes=("", "_preds"),
-    )  # Eğer string label yoksa, numeric tp_sl_result'tan türet
-    if "tp_sl_result_label" not in merged.columns and "tp_sl_result" in merged.columns:
-        def map_tp_label(v):
-            if pd.isna(v):
-                return np.nan
-            # v2 pipeline'da tp_sl_result genelde şu şekilde:
-            #  >0  → TP
-            #  <0  → SL
-            #  ==0 → BE
-            if v > 0:
-                return "TP"
-            if v < 0:
-                return "SL"
-            return "BE"
+    )
 
-        merged["tp_sl_result_label"] = merged["tp_sl_result"].apply(map_tp_label)
-
-    # outcome kolonlarını preds versiyonundan al (varsa *_preds)
-    for col in ["future_dir", "tp_sl_result", "max_up_move_pips", "max_down_move_pips"]:
-        preds_col = f"{col}_preds"
-        if preds_col in merged.columns:
-            merged[col] = merged[preds_col]
-
-    if "future_dir_label" not in merged.columns and "future_dir" in merged.columns:
-        merged["future_dir_label"] = merged["future_dir"].apply(normalize_future_dir)
+    merged = _ensure_future_dir_label(merged)
+    merged = _ensure_tp_sl_result_label(merged)
 
     missing_preds = merged["pred_label"].isna().sum()
     if missing_preds > 0:
@@ -164,86 +200,160 @@ def merge_signals_with_preds(sig_df: pd.DataFrame, preds_df: pd.DataFrame) -> pd
     return merged
 
 
+# -----------------------------------------------------------------------------
+# Structural filters (SHORT context)
+# -----------------------------------------------------------------------------
+def _is_model_bias_short(row: pd.Series) -> tuple[bool, str]:
+    """Golden rule: p_down must dominate p_up and p_chop."""
+
+    if pd.isna(row.get("pred_label")):
+        return False, "no_pred"
+
+    p_up = row.get("p_up", np.nan)
+    p_down = row.get("p_down", np.nan)
+    p_chop = row.get("p_chop", np.nan)
+
+    if pd.isna(p_up) or pd.isna(p_down) or pd.isna(p_chop):
+        return False, "missing_probs"
+
+    if (p_down >= p_up) and (p_down >= p_chop):
+        return True, "model_bias_short"
+    return False, "model_bias_not_short"
+
+
+def _passes_pattern_wave_filter(row: pd.Series) -> bool:
+    if not USE_PATTERN_WAVE_FILTER:
+        return True
+
+    wave_val = row.get("signal_wave_at_entry")
+    if pd.isna(wave_val):
+        return True
+
+    try:
+        wave_int = int(wave_val)
+    except (TypeError, ValueError):
+        return True
+
+    return wave_int in ALLOWED_SHORT_WAVES
+
+
+def _passes_channel_filter_short(row: pd.Series) -> bool:
+    """Channel/regime filter mirrored for SHORT entries."""
+
+    if not USE_CHANNEL_FILTER:
+        return True
+
+    down_flag = row.get("chan_is_down_M30_at_entry")
+    range_flag = row.get("is_range_M30_at_entry")
+    near_upper = row.get("near_upper_chan_M30_at_entry")
+
+    cond_down = pd.notna(down_flag) and int(down_flag) == 1
+    cond_range_upper = pd.notna(range_flag) and int(range_flag) == 1 and pd.notna(near_upper) and int(near_upper) == 1
+    cond_near_upper = pd.notna(near_upper) and int(near_upper) == 1
+
+    if cond_down or cond_range_upper or cond_near_upper:
+        return True
+    if pd.isna(down_flag) and pd.isna(range_flag) and pd.isna(near_upper):
+        return True
+    return False
+
+
+def _first_available_reaction_count(row: pd.Series, candidates: Iterable[str]) -> Optional[float]:
+    for col in candidates:
+        if col in row and pd.notna(row[col]):
+            return float(row[col])
+    return None
+
+
+def _passes_sr_filter_short(row: pd.Series) -> bool:
+    if not USE_SR_FILTER:
+        return True
+
+    strength = row.get("sr_resistance_strength_at_entry")
+    strength_ok = pd.isna(strength) or float(strength) >= MIN_SR_STRENGTH
+
+    near_flag = row.get("sr_near_resistance_at_entry")
+    nearest_type = str(row.get("nearest_sr_type", "")).upper()
+    nearest_dist = row.get("nearest_sr_dist_pips")
+    resistance_distance = row.get("sr_resistance_distance_pips_at_entry")
+
+    dist_candidates = []
+    if pd.notna(resistance_distance):
+        dist_candidates.append(float(resistance_distance))
+    if nearest_type == "RESISTANCE" and pd.notna(nearest_dist):
+        dist_candidates.append(float(nearest_dist))
+
+    distance_ok = True
+    if dist_candidates:
+        distance_ok = min(dist_candidates) <= MAX_SR_DISTANCE_PIPS
+
+    near_ok = True
+    if pd.notna(near_flag):
+        near_ok = int(near_flag) == 1
+    elif nearest_type:
+        near_ok = nearest_type == "RESISTANCE"
+
+    reaction_cols = [
+        "sr_resistance_reaction_count_at_entry",
+        "sr_resistance_num_reactions_at_entry",
+        "sr_resistance_reaction_count_band_at_entry",
+    ]
+    reactions = _first_available_reaction_count(row, reaction_cols)
+    reactions_ok = True if reactions is None else reactions >= MIN_SR_REACTIONS
+
+    return strength_ok and distance_ok and near_ok and reactions_ok
+
+
+# -----------------------------------------------------------------------------
+# Decision Logic
+# -----------------------------------------------------------------------------
 def apply_fake_live_short_logic(merged: pd.DataFrame) -> pd.DataFrame:
     """
-    SHORT için karar mantığı (sıkılaştırılmış v2):
-      final_action:
-        - SHORT : Tüm filtrelerden geçerse
-        - PASS  : Diğer tüm durumlar
-        - NO_PRED : Model tahmini yoksa
-    
-    Filtreler:
-      1. Model tahmini olmalı
-      2. p_down >= P_DOWN_MIN
-      3. p_down - p_up >= P_DOWN_MARGIN (DOWN, UP'tan belirgin yüksek)
-      4. p_chop <= P_CHOP_MAX (çok belirsiz olmamalı)
-      5. max_prob >= HIGH_CONF_THRESHOLD
-      6. (opsiyonel) Regime = DOWN_TREND
+    SHORT fake-live karar mantığı (golden rule + yapısal filtreler):
+
+      - Model tahmini yoksa → NO_PRED
+      - direction SHORT/SELL değilse → PASS
+      - p_down en büyük değilse → PASS
+      - Yapısal filtreler (pattern wave, kanal, SR) devredeyse hepsinden geçerse → SHORT
+      - Aksi halde → PASS
     """
-    logger.info("🧠 Fake-live SHORT karar mantığı uygulanıyor (sıkılaştırılmış v2)...")
-    logger.info("   📊 Filtre parametreleri:")
-    logger.info("      • HIGH_CONF_THRESHOLD : %.2f", HIGH_CONF_THRESHOLD)
-    logger.info("      • P_DOWN_MIN          : %.2f", P_DOWN_MIN)
-    logger.info("      • P_DOWN_MARGIN       : %.2f", P_DOWN_MARGIN)
-    logger.info("      • P_CHOP_MAX          : %.2f", P_CHOP_MAX)
-    logger.info("      • REQUIRE_DOWN_TREND  : %s", REQUIRE_DOWN_TREND)
+
+    logger.info("🧠 Fake-live SHORT karar mantığı uygulanıyor...")
+    logger.info(
+        "   📊 Filtre parametreleri: pattern_filter=%s channel_filter=%s sr_filter=%s",
+        USE_PATTERN_WAVE_FILTER,
+        USE_CHANNEL_FILTER,
+        USE_SR_FILTER,
+    )
+    logger.info(
+        "   📊 SR eşikleri: MIN_SR_STRENGTH=%.2f MAX_SR_DISTANCE_PIPS=%.1f MIN_SR_REACTIONS=%d",
+        MIN_SR_STRENGTH,
+        MAX_SR_DISTANCE_PIPS,
+        MIN_SR_REACTIONS,
+    )
 
     df = merged.sort_values("timestamp").reset_index(drop=True).copy()
 
-    # Regime kolonunu hazırla (varsa)
-    regime_col = None
-    for col in ["regime_M30", "regime", "chan_is_down_M30_at_entry"]:
-        if col in df.columns:
-            regime_col = col
-            break
-
     def decide_row(row) -> str:
-        # 1) Model tahmini yoksa
         if pd.isna(row.get("pred_label")):
             return "NO_PRED"
 
-        # 2) Direction kontrolü
         if row.get("direction") not in ("SHORT", "SELL", None):
             return "PASS"
 
-        # Probability değerlerini al
-        p_up = row.get("p_up", np.nan)
-        p_down = row.get("p_down", np.nan)
-        p_chop = row.get("p_chop", np.nan)
-        max_prob = row.get("max_prob", 0.0)
-
-        # 3) Probability değerleri eksikse PASS
-        if pd.isna(p_up) or pd.isna(p_down) or pd.isna(p_chop):
+        model_ok, _ = _is_model_bias_short(row)
+        if not model_ok:
             return "PASS"
 
-        # 4) p_down minimum threshold
-        if p_down < P_DOWN_MIN:
+        if not _passes_pattern_wave_filter(row):
             return "PASS"
 
-        # 5) p_down, p_up'tan belirgin yüksek olmalı
-        if (p_down - p_up) < P_DOWN_MARGIN:
+        if not _passes_channel_filter_short(row):
             return "PASS"
 
-        # 6) p_chop çok yüksekse (belirsizlik) PASS
-        if p_chop > P_CHOP_MAX:
+        if not _passes_sr_filter_short(row):
             return "PASS"
 
-        # 7) max_prob (confidence) kontrolü
-        if max_prob < HIGH_CONF_THRESHOLD:
-            return "PASS"
-
-        # 8) (Opsiyonel) Regime filtresi
-        if REQUIRE_DOWN_TREND and regime_col:
-            regime_val = row.get(regime_col)
-            # DOWN_TREND veya chan_is_down_M30_at_entry == 1
-            if regime_col == "regime_M30" or regime_col == "regime":
-                if regime_val != "DOWN_TREND":
-                    return "PASS"
-            elif regime_col == "chan_is_down_M30_at_entry":
-                if regime_val != 1:
-                    return "PASS"
-
-        # Tüm filtrelerden geçti → SHORT aç
         return "SHORT"
 
     df["final_action"] = df.apply(decide_row, axis=1)
@@ -259,45 +369,33 @@ def apply_fake_live_short_logic(merged: pd.DataFrame) -> pd.DataFrame:
     logger.info("   • PASS       : %d (%.2f%%)", n_pass, 100 * n_pass / total if total else 0)
     logger.info("   • NO_PRED    : %d (%.2f%%)", n_nopred, 100 * n_nopred / total if total else 0)
 
-    # Performans (sadece SHORT alınanlar için)
     mask_short = df["final_action"] == "SHORT"
     if mask_short.any():
         short_df = df[mask_short].copy()
 
-        # 1) Yön başarısı (DOWN bekliyoruz)
-        if "future_dir_label" in short_df.columns:
-            dir_col = short_df["future_dir_label"].astype(str).str.upper()
-        else:
-            dir_col = short_df["future_dir"].apply(normalize_future_dir)
+        dir_col = short_df["future_dir_label"].astype(str).str.upper()
         dir_win_rate = (dir_col == "DOWN").mean()
 
-        # 2) TP/SL – SHORT için pip bazlı hesap
         tp_rate = sl_rate = be_rate = float("nan")
-        if "tp_pips" in short_df.columns and "sl_pips" in short_df.columns:
+        required_cols = {"tp_pips", "sl_pips", "max_up_move_pips", "max_down_move_pips"}
+        if required_cols.issubset(short_df.columns):
             tp_pips = short_df["tp_pips"].astype(float)
             sl_pips = short_df["sl_pips"].astype(float)
             max_up = short_df["max_up_move_pips"].astype(float)
             max_down = short_df["max_down_move_pips"].astype(float)
 
-            # SHORT pozisyon için:
-            # - max_down negatif gelir (aşağı gitmiş = kâr), mutlak değeri tp_pips'ten büyükse TP
-            # - max_up pozitif gelir (yukarı gitmiş = zarar), değeri sl_pips'ten büyükse SL
-            # ÖNEMLİ: Önce TP kontrolü, TP yoksa SL kontrolü (bir trade hem TP hem SL'ye ulaşamaz)
-            
-            # TP kontrolü: max_down negatif olduğu için -max_down = mutlak değer
-            hit_tp = (-max_down >= tp_pips)
-            
-            # SL kontrolü: TP'ye ulaşmayanlarda kontrol et
+            hit_tp = (-max_down) >= tp_pips
             hit_sl = (~hit_tp) & (max_up >= sl_pips)
-            
-            # BE: Ne TP ne SL'ye ulaşanlar
             be_mask = ~(hit_tp | hit_sl)
 
-            n = len(short_df)
-            if n > 0:
-                tp_rate = hit_tp.mean()
-                sl_rate = hit_sl.mean()
-                be_rate = be_mask.mean()
+            tp_rate = hit_tp.mean()
+            sl_rate = hit_sl.mean()
+            be_rate = be_mask.mean()
+        else:
+            logger.warning(
+                "⚠️ SHORT trades için TP/SL hesaplamak için gerekli kolonlar eksik: %s",
+                required_cols - set(short_df.columns),
+            )
 
         logger.info(
             "   ✅ SHORT trades directional win-rate (future_dir==DOWN): %.3f",
@@ -315,8 +413,12 @@ def apply_fake_live_short_logic(merged: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
+# -----------------------------------------------------------------------------
+# Save
+# -----------------------------------------------------------------------------
 def save_output(df: pd.DataFrame) -> None:
     """Short sonucu parquet + csv olarak kaydeder."""
+
     Path(OUTPUT_PARQUET).parent.mkdir(parents=True, exist_ok=True)
 
     df.to_parquet(OUTPUT_PARQUET, index=False)
@@ -326,6 +428,9 @@ def save_output(df: pd.DataFrame) -> None:
     logger.info("💾 Kaydedildi (CSV)    : %s", OUTPUT_CSV)
 
 
+# -----------------------------------------------------------------------------
+# MAIN
+# -----------------------------------------------------------------------------
 def main():
     sig_df, preds_df = load_data()
     merged = merge_signals_with_preds(sig_df, preds_df)
