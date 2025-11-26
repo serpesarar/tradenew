@@ -1,0 +1,53 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+dist/
+build/
+
+# Virtual environments
+venv/
+nasdaq_venv/
+env/
+ENV/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Data files
+*.parquet
+*.csv
+*.pkl
+*.h5
+*.hdf5
+
+# Logs
+*.log
+*.txt
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Models (büyük dosyalar)
+models/*.pkl
+models/*.h5
+
+# Staging (data files)
+staging/*.parquet
+staging/*.csv
+
+# Kernel temp
+kernel_temp/
+
+# Jupyter
+.ipynb_checkpoints/
+*.ipynb
+
