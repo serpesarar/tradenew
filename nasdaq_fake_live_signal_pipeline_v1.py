@@ -17,7 +17,7 @@ HIGH_CONF_THRESHOLD = 0.60  # Şimdilik kullanmıyoruz ama ileride threshold tun
 # Logging
 # -----------------------------------------------------------------------------
 logging.basicConfig(
-    level=logging.INFO,
+    level = logging.INFO,
     format="%(asctime)s - %(levelname)s - %(message)s",
 )
 logger = logging.getLogger("fake_live_signal_pipeline")
@@ -29,7 +29,7 @@ logger = logging.getLogger("fake_live_signal_pipeline")
 def _ensure_future_dir_label(df: pd.DataFrame) -> pd.DataFrame:
     """
     future_dir_label yoksa, future_dir'dan türet.
-    - Eğer future_dir numeric ise: 0=CHOP, 1=DOWN, 2=UP (v2 label encoder gibi)
+    - Eğer future_dir numeric ise: 0 = CHOP, 1 = DOWN, 2 = UP (v2 label encoder gibi)
     - Eğer string ise: direkt uppercase.
     """
     df = df.copy()
@@ -137,7 +137,7 @@ def merge_signals_with_preds(sig_df: pd.DataFrame, preds_df: pd.DataFrame) -> pd
     NOT:
     - Karar mantığı için zorunlu kolonlar:
         timestamp, event_type, entry_price, p_chop, p_up, p_down, pred_label, max_prob
-    - Diğer kolonlar (future_dir, tp_sl_result, max_up_move_pips vs.) sadece log/backtest için.
+    - Diğer kolonlar (future_dir, tp_sl_result, max_up_move_pips vs.) sadece log / backtest için.
     """
     logger.info("🔗 Playbook sinyalleri ile model tahminleri merge ediliyor...")
 
@@ -215,10 +215,10 @@ def merge_signals_with_preds(sig_df: pd.DataFrame, preds_df: pd.DataFrame) -> pd
 # -----------------------------------------------------------------------------
 def apply_fake_live_logic(merged: pd.DataFrame) -> pd.DataFrame:
     """
-    LONG fake-live karar mantığı:
+    LONG fake - live karar mantığı:
 
       - Model tahmini yoksa → NO_PRED
-      - direction LONG/BUY değilse → PASS
+      - direction LONG / BUY değilse → PASS
       - p_up, p_down, p_chop NaN ise → PASS
       - p_up en büyük ise → LONG
       - Aksi halde → PASS
@@ -331,10 +331,10 @@ def apply_fake_live_logic(merged: pd.DataFrame) -> pd.DataFrame:
 # -----------------------------------------------------------------------------
 def save_output(df: pd.DataFrame) -> None:
     """Sonucu parquet + csv olarak kaydeder."""
-    Path(OUTPUT_PARQUET).parent.mkdir(parents=True, exist_ok=True)
+    Path(OUTPUT_PARQUET).parent.mkdir(parents = True, exist_ok = True)
 
-    df.to_parquet(OUTPUT_PARQUET, index=False)
-    df.to_csv(OUTPUT_CSV, index=False)
+    df.to_parquet(OUTPUT_PARQUET, index = False)
+    df.to_csv(OUTPUT_CSV, index = False)
 
     logger.info("💾 Kaydedildi (Parquet): %s", OUTPUT_PARQUET)
     logger.info("💾 Kaydedildi (CSV)    : %s", OUTPUT_CSV)
