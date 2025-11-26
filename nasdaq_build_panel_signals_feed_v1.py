@@ -42,6 +42,7 @@ def main():
         "timestamp",
         "side",            # LONG / SHORT
         "final_action",    # LONG / SHORT
+        "direction",       # direction kolonu varsa
         "event_type",
 
         # Fiyat & TP/SL
@@ -65,6 +66,8 @@ def main():
         "pred_label",
         "max_prob",
         "recommendation",
+        "future_dir_label",
+        "tp_sl_result_label",
 
         # Gerçek outcome (backtest için)
         "future_dir",
@@ -97,6 +100,7 @@ def main():
         "is_range_M30_at_entry",
         "near_lower_chan_M30_at_entry",
         "near_upper_chan_M30_at_entry",
+        "regime_M30",
     ]
 
     # Sadece df'de gerçekten olan kolonları al (short df’de olmayan bir iki kolon olabilir diye)

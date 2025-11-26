@@ -3,7 +3,7 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
-from pandas.api.types import is_numeric_dtype
+
 # ============================================================================
 # PATHLER
 # ============================================================================
@@ -12,7 +12,7 @@ UNIFIED_SIGNALS_PATH = "./staging/nasdaq_fake_live_unified_signals_with_model_v1
 OUTPUT_PARQUET = "./staging/nasdaq_fake_live_unified_backtest_regimes_v1.parquet"
 REPORT_TXT = "./models/nasdaq_backtest_unified_regime_analysis_v1.txt"
 
-# 🔧 Spread + komisyon (pip cinsinden)  → bunları istediğin gibi ayarlayabilirsin
+# 🔧 Spread + komisyon (pip cinsinden) – tunable
 SPREAD_PIPS_LONG = 1.0
 SPREAD_PIPS_SHORT = 1.0
 COMMISSION_PIPS = 0.5  # trade başına ek maliyet
@@ -40,21 +40,20 @@ def load_unified_df() -> pd.DataFrame:
     df = pd.read_parquet(UNIFIED_SIGNALS_PATH)
     logger.info("   ✅ Unified df shape: %s", df.shape)
 
-    # timestamp'i datetime yap
     if "timestamp" in df.columns:
         df["timestamp"] = pd.to_datetime(df["timestamp"])
+
+    # direction/final_action'i string yap
+    for col in ["direction", "final_action"]:
+        if col in df.columns:
+            df[col] = df[col].astype("string")
 
     return df
 
 
 def add_regime_labels(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    M30 kanal / range flag'lerinden basit bir regime label üret:
-      - UP_TREND
-      - DOWN_TREND
-      - RANGE
-      - OTHER
-    """
+    """M30 kanal / range flag'lerinden basit bir regime label üretir."""
+
     df = df.copy()
 
     up_col = "chan_is_up_M30_at_entry"
@@ -84,16 +83,45 @@ def add_regime_labels(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
-def compute_trade_pnl(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    final_action ∈ {LONG, SHORT} olan satırlar için pip PnL + cost hesapla.
+def _compute_single_trade(row: pd.Series) -> dict:
+    """Realized TP/SL outcome based on observed max moves (pip)."""
 
-    Öncelik:
-      1) tp_sl_result_label varsa → onu kullan (TP / SL / BE)
-      2) Yoksa tp_sl_result'ı decode et:
-           - primary mapping: 1 → TP, 0 → SL, 2 → BE  (dataset kodun)
-           - fallback:        >0 → TP, <0 → SL, 0 → BE
-    """
+    action = str(row.get("final_action", "")).upper()
+    tp_pips = float(row.get("tp_pips", np.nan))
+    sl_pips = float(row.get("sl_pips", np.nan))
+    max_up = float(row.get("max_up_move_pips", np.nan))
+    max_down = float(row.get("max_down_move_pips", np.nan))
+
+    hit_tp = False
+    hit_sl = False
+
+    if action == "LONG":
+        hit_tp = pd.notna(max_up) and pd.notna(tp_pips) and max_up >= tp_pips
+        hit_sl = pd.notna(max_down) and pd.notna(sl_pips) and (-max_down) >= sl_pips
+    elif action == "SHORT":
+        hit_tp = pd.notna(max_down) and pd.notna(tp_pips) and (-max_down) >= tp_pips
+        hit_sl = pd.notna(max_up) and pd.notna(sl_pips) and max_up >= sl_pips
+
+    # If both triggered (rare/unknown order), prefer TP for optimism consistency with legacy
+    result_label = "BE"
+    if hit_tp and not hit_sl:
+        result_label = "TP"
+    elif hit_sl and not hit_tp:
+        result_label = "SL"
+    elif hit_tp and hit_sl:
+        result_label = "TP"
+
+    gross_pips = 0.0
+    if result_label == "TP":
+        gross_pips = tp_pips
+    elif result_label == "SL":
+        gross_pips = -sl_pips
+
+    return {"tp_sl_result_label": result_label, "gross_pips_no_cost": gross_pips}
+
+
+def compute_trade_pnl(df: pd.DataFrame) -> pd.DataFrame:
+    """final_action ∈ {LONG, SHORT} olan satırlar için pip PnL + cost hesapla."""
 
     if "final_action" not in df.columns:
         raise ValueError("❌ Unified df içinde 'final_action' kolonu yok.")
@@ -101,83 +129,15 @@ def compute_trade_pnl(df: pd.DataFrame) -> pd.DataFrame:
     trades = df[df["final_action"].isin(["LONG", "SHORT"])].copy()
     logger.info("   ✅ Trade satırları filtrelendi. shape=%s", trades.shape)
 
-    # direction / side
-    if "direction" in trades.columns:
-        trades["direction"] = trades["direction"].fillna(trades["final_action"])
-    else:
-        trades["direction"] = trades["final_action"]
+    # Numerik kolon tiplerini zorla
+    numeric_cols = ["tp_pips", "sl_pips", "max_up_move_pips", "max_down_move_pips"]
+    for col in numeric_cols:
+        trades[col] = pd.to_numeric(trades.get(col, np.nan), errors="coerce")
 
-    # TP / SL pip mesafeleri
-    if "tp_pips" not in trades.columns or "sl_pips" not in trades.columns:
-        raise ValueError("❌ Trades içinde tp_pips ve/veya sl_pips kolonları yok.")
-
-    trades["tp_pips"] = trades["tp_pips"].astype(float)
-    trades["sl_pips"] = trades["sl_pips"].astype(float)
-
-    # ------------------------------------------------------------------
-    # 1) Önce hazır label var mı? (tp_sl_result_label)
-    # ------------------------------------------------------------------
-    if "tp_sl_result_label" in trades.columns:
-        res = trades["tp_sl_result_label"].astype("string").str.upper().fillna("UNKNOWN")
-
-    # ------------------------------------------------------------------
-    # 2) Yoksa tp_sl_result'ı yorumla
-    # ------------------------------------------------------------------
-    elif "tp_sl_result" in trades.columns:
-        raw = trades["tp_sl_result"]
-
-        # Numeric parse dene
-        num = pd.to_numeric(raw, errors="coerce")
-
-        if num.notna().any():
-            # Dataset-specific mapping: 1 → TP, 0 → SL, 2 → BE
-            # Ama yine de fallback olarak >0/<0/0 kuralını da ekleyelim.
-            mapped = np.select(
-                [
-                    num == 1,      # net TP
-                    num == 0,      # net SL
-                    num == 2,      # BE / none
-                    num > 0,       # herhangi pozitif
-                    num < 0        # herhangi negatif
-                ],
-                [
-                    "TP",
-                    "SL",
-                    "BE",
-                    "TP",
-                    "SL"
-                ],
-                default="BE",
-            )
-
-            res = pd.Series(mapped, index=trades.index)
-
-            # Parse edilemeyenler (NaN) için, ham string'e bak (TP/SL/BE yazıyor olabilir)
-            raw_str = raw.astype("string").str.upper()
-            res = res.where(num.notna(), raw_str.fillna("UNKNOWN"))
-
-        else:
-            # Hiç numeric parse edemediysek, tamamen string label olarak düşün
-            res = raw.astype("string").str.upper().fillna("UNKNOWN")
-    else:
-        # Hiç kolon yoksa hepsini BE gibi say (çok edge-case)
-        res = pd.Series(["BE"] * len(trades), index=trades.index)
-
-    # ------------------------------------------------------------------
-    # Brüt PnL (cost hariç) – TP/SL/BE'ye göre
-    # ------------------------------------------------------------------
-    gross_pips = np.where(
-        res == "TP",
-        trades["tp_pips"],
-        np.where(
-            res == "SL",
-            -trades["sl_pips"],
-            0.0,  # BE
-        ),
-    )
-
-    trades["tp_sl_result_label"] = res
-    trades["gross_pips_no_cost"] = gross_pips
+    # Realized outcome from price path
+    realized = trades.apply(_compute_single_trade, axis=1, result_type="expand")
+    trades["tp_sl_result_label"] = realized["tp_sl_result_label"]
+    trades["gross_pips_no_cost"] = realized["gross_pips_no_cost"]
 
     # Spread + komisyon maliyeti
     spread_cost = np.where(
@@ -185,9 +145,7 @@ def compute_trade_pnl(df: pd.DataFrame) -> pd.DataFrame:
         SPREAD_PIPS_LONG,
         SPREAD_PIPS_SHORT,
     )
-
     total_cost = spread_cost + COMMISSION_PIPS
-
     trades["cost_pips"] = total_cost
     trades["net_pips"] = trades["gross_pips_no_cost"] - trades["cost_pips"]
 
@@ -199,20 +157,17 @@ def compute_trade_pnl(df: pd.DataFrame) -> pd.DataFrame:
     logger.info(
         "   ✅ PnL hesaplandı. Örnek satır:\n%s",
         trades[[
-            "timestamp", "final_action", "direction",
-            "tp_pips", "sl_pips",
-            "tp_sl_result", "tp_sl_result_label",
+            "timestamp", "final_action", "tp_pips", "sl_pips", "tp_sl_result_label",
             "gross_pips_no_cost", "cost_pips", "net_pips"
         ]].head(1).to_string(index=False),
     )
 
     return trades
+
+
 def add_time_period_labels(trades: pd.DataFrame) -> pd.DataFrame:
-    """
-    Zaman serisi split (pseudo-OOS):
-      - TRAIN_LIKE: ilk %80
-      - OOS_LAST20: son %20
-    """
+    """Zaman serisi split (pseudo-OOS): ilk %80 → TRAIN_LIKE, son %20 → OOS_LAST20."""
+
     trades = trades.sort_values("timestamp").reset_index(drop=True)
     n = len(trades)
     if n == 0:
@@ -222,7 +177,7 @@ def add_time_period_labels(trades: pd.DataFrame) -> pd.DataFrame:
     split_idx = int(n * 0.8)
     split_ts = trades.loc[split_idx, "timestamp"]
 
-    logger.info("   ⏱️ Time-series split: ilk %%80 < %s → TRAIN_LIKE, sonrası → OOS_LAST20", split_ts)
+    logger.info("   ⏱️ Time-series split: ilk %80 < %s → TRAIN_LIKE, sonrası → OOS_LAST20", split_ts)
 
     trades["time_period"] = np.where(
         trades["timestamp"] < split_ts,
@@ -234,9 +189,8 @@ def add_time_period_labels(trades: pd.DataFrame) -> pd.DataFrame:
 
 
 def summarize_backtest(trades: pd.DataFrame) -> str:
-    """
-    Genel, direction ve regime bazlı özet rapor üretir (string).
-    """
+    """Genel, direction ve regime bazlı özet rapor üretir (string)."""
+
     lines = []
     lines.append("=" * 80)
     lines.append("NASDAQ UNIFIED BACKTEST + REGIME ANALYSIS v1")
@@ -245,7 +199,6 @@ def summarize_backtest(trades: pd.DataFrame) -> str:
     lines.append(f"Toplam trade sayısı: {len(trades)}")
     lines.append("")
 
-    # Genel özet
     def summary_block(name: str, sub_df: pd.DataFrame):
         if len(sub_df) == 0:
             lines.append(f"[{name}] → trade yok.")
@@ -305,6 +258,42 @@ def save_outputs(trades: pd.DataFrame, report_text: str) -> None:
     with open(REPORT_TXT, "w", encoding="utf-8") as f:
         f.write(report_text)
     logger.info("💾 Rapor kaydedildi: %s", REPORT_TXT)
+
+
+# ---------------------------------------------------------------------------
+# Quick diagnostic helper
+# ---------------------------------------------------------------------------
+def quick_diagnostics(path: str = OUTPUT_PARQUET) -> None:
+    """Load backtest parquet and print basic win-rates by direction/regime."""
+
+    if not Path(path).exists():
+        logger.warning("⚠️ Diagnostics skipped: %s bulunamadı", path)
+        return
+
+    trades = pd.read_parquet(path)
+    if "regime_M30" not in trades.columns:
+        logger.warning("⚠️ Diagnostics skipped: regime_M30 kolonu yok")
+        return
+
+    for col in ["final_action", "regime_M30"]:
+        trades[col] = trades[col].astype("string")
+
+    logger.info("📊 Quick diagnostics from %s", path)
+    for direction in ["LONG", "SHORT"]:
+        sub = trades[trades["final_action"] == direction]
+        if len(sub) == 0:
+            logger.info("   • %s: trade yok", direction)
+            continue
+        win_rate = sub.get("is_win", pd.Series(dtype=float)).mean()
+        logger.info("   • %s trades: n=%d win_rate=%.3f", direction, len(sub), win_rate)
+        for regime in sorted(sub["regime_M30"].dropna().unique()):
+            sub_r = sub[sub["regime_M30"] == regime]
+            logger.info(
+                "       - regime=%s: n=%d win_rate=%.3f",
+                regime,
+                len(sub_r),
+                sub_r.get("is_win", pd.Series(dtype=float)).mean(),
+            )
 
 
 # ============================================================================
