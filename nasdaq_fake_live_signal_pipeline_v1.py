@@ -447,11 +447,19 @@ def _context_score(row: pd.Series) -> float:
 
 
 def _compute_context_score_safe(row: pd.Series) -> float:
-    """Compute context score only when probabilities are present.
+    """Compute context score only when a valid LONG candidate can be evaluated.
 
-    This avoids misleading scores on rows where preds are missing; NO_PRED/PASS rows
-    get NaN so logged averages reflect only evaluated candidates.
+    - Requires all three probabilities to exist.
+    - Requires a model prediction row (pred_label present) and LONG/BUY direction.
+    This keeps PASS/NO_PRED rows (or short playbook leaks) from skewing the score logs.
     """
+
+    if pd.isna(row.get("pred_label")):
+        return np.nan
+
+    direction = row.get("direction")
+    if direction not in ("LONG", "BUY", None):
+        return np.nan
 
     p_up = pd.to_numeric(row.get("p_up"), errors="coerce")
     p_down = pd.to_numeric(row.get("p_down"), errors="coerce")
