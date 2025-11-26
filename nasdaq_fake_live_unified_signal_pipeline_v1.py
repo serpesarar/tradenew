@@ -37,6 +37,8 @@ def load_long_short() -> tuple[pd.DataFrame, pd.DataFrame]:
 
 
 def unify_long_short(long_df: pd.DataFrame, short_df: pd.DataFrame) -> pd.DataFrame:
+    """Concatenate LONG + SHORT fake-live streams with normalized schema/dtypes."""
+
     # Güvenlik için direction/final_action kolonlarını normalize edelim
     long_df = long_df.copy()
     short_df = short_df.copy()
@@ -58,13 +60,26 @@ def unify_long_short(long_df: pd.DataFrame, short_df: pd.DataFrame) -> pd.DataFr
     if "final_action" not in short_df.columns:
         short_df["final_action"] = "SHORT"
 
+    # Timestamp to datetime for proper sorting
+    if "timestamp" in long_df.columns:
+        long_df["timestamp"] = pd.to_datetime(long_df["timestamp"])
+    if "timestamp" in short_df.columns:
+        short_df["timestamp"] = pd.to_datetime(short_df["timestamp"])
+
     # Kolon setlerini hizala (eksik kolonlar için NaN oluştur)
     all_cols = sorted(set(long_df.columns) | set(short_df.columns))
     long_df = long_df.reindex(columns=all_cols)
     short_df = short_df.reindex(columns=all_cols)
 
     unified = pd.concat([long_df, short_df], ignore_index=True)
-    unified = unified.sort_values("timestamp").reset_index(drop=True)
+    if "timestamp" in unified.columns:
+        unified = unified.sort_values("timestamp").reset_index(drop=True)
+
+    # Normalize basic categorical values
+    if "final_action" in unified.columns:
+        unified["final_action"] = unified["final_action"].astype("string").str.upper()
+    if "direction" in unified.columns:
+        unified["direction"] = unified["direction"].astype("string").str.upper()
 
     # 🔧 Tip fix: kategorik kolonları string'e zorla (pyarrow parquet hatasını engelle)
     cat_cols = [
@@ -78,6 +93,7 @@ def unify_long_short(long_df: pd.DataFrame, short_df: pd.DataFrame) -> pd.DataFr
         "event_type",
         "nearest_sr_type",
         "regime_M30",
+        "time_period",
     ]
     for c in cat_cols:
         if c in unified.columns:
@@ -94,6 +110,25 @@ def unify_long_short(long_df: pd.DataFrame, short_df: pd.DataFrame) -> pd.DataFr
         "max_up_move_pips",
         "max_down_move_pips",
         "entry_price",
+        "sr_support_strength_at_entry",
+        "sr_support_distance_pips_at_entry",
+        "sr_resistance_strength_at_entry",
+        "sr_resistance_distance_pips_at_entry",
+        "sr_near_support_at_entry",
+        "sr_near_resistance_at_entry",
+        "nearest_sr_dist_pips",
+        "chan_is_up_M30_at_entry",
+        "chan_is_down_M30_at_entry",
+        "is_range_M30_at_entry",
+        "near_lower_chan_M30_at_entry",
+        "near_upper_chan_M30_at_entry",
+        "signal_wave_at_entry",
+        "wave_strength_pips_at_entry",
+        "wave_duration_bars_at_entry",
+        "up_move_pips_at_entry",
+        "down_move_pips_at_entry",
+        "up_duration_bars_at_entry",
+        "down_duration_bars_at_entry",
     ]
     for c in num_cols:
         if c in unified.columns:
