@@ -129,9 +129,14 @@ def compute_trade_pnl(df: pd.DataFrame) -> pd.DataFrame:
     trades = df[df["final_action"].isin(["LONG", "SHORT"])].copy()
     logger.info("   ✅ Trade satırları filtrelendi. shape=%s", trades.shape)
 
+    # Zorunlu pip kolonları yoksa erken uyarı ver (hesap doğru yapılamaz)
+    required_cols = {"tp_pips", "sl_pips", "max_up_move_pips", "max_down_move_pips"}
+    missing = required_cols - set(trades.columns)
+    if missing:
+        raise ValueError(f"❌ Trades içinde eksik zorunlu pip kolonları var: {missing}")
+
     # Numerik kolon tiplerini zorla
-    numeric_cols = ["tp_pips", "sl_pips", "max_up_move_pips", "max_down_move_pips"]
-    for col in numeric_cols:
+    for col in required_cols:
         trades[col] = pd.to_numeric(trades.get(col, np.nan), errors="coerce")
 
     # Realized outcome from price path
