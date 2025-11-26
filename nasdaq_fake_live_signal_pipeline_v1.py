@@ -446,6 +446,24 @@ def _context_score(row: pd.Series) -> float:
     return score
 
 
+def _compute_context_score_safe(row: pd.Series) -> float:
+    """Compute context score only when probabilities are present.
+
+    This avoids misleading scores on rows where preds are missing; NO_PRED/PASS rows
+    get NaN so logged averages reflect only evaluated candidates.
+    """
+
+    p_up = pd.to_numeric(row.get("p_up"), errors="coerce")
+    p_down = pd.to_numeric(row.get("p_down"), errors="coerce")
+    p_chop = pd.to_numeric(row.get("p_chop"), errors="coerce")
+
+    if pd.isna(p_up) or pd.isna(p_down) or pd.isna(p_chop):
+        return np.nan
+
+    # Use the base scorer (includes model edge and structural adjustments)
+    return _context_score(row)
+
+
 # -----------------------------------------------------------------------------
 # Decision Logic
 # -----------------------------------------------------------------------------
@@ -482,6 +500,9 @@ def apply_fake_live_logic(merged: pd.DataFrame) -> pd.DataFrame:
 
     df = merged.sort_values("timestamp").reset_index(drop=True).copy()
 
+    # Precompute context_score once so decision + logging share the same value
+    df["context_score"] = df.apply(_compute_context_score_safe, axis=1)
+
     def decide_row(row) -> str:
         # Model tahmini yoksa → NO_PRED
         if pd.isna(row.get("pred_label")):
@@ -497,13 +518,14 @@ def apply_fake_live_logic(merged: pd.DataFrame) -> pd.DataFrame:
             return "PASS"
 
         # Additive structural score (favour support/uptrend, avoid resistance/upper band)
-        score = _context_score(row)
+        score = row.get("context_score")
+        if pd.isna(score):
+            return "PASS"
 
         if score >= CONTEXT_SCORE_THRESHOLD:
             return "LONG"
         return "PASS"
 
-    df["context_score"] = df.apply(_context_score, axis=1)
     df["final_action"] = df.apply(decide_row, axis=1)
 
     # Quick metrikler
